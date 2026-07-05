@@ -66,5 +66,14 @@
 	<true/>
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<key>NSAppleScriptEnabled</key>
+	<string>YES</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>This application needs to send Apple events to control other applications via AppleScript.</string>
+	<key>LSArchitecturePriority</key>
+	<array>
+		<string>arm64</string>
+		<string>x86_64</string>
+	</array>
 </dict>
 </plist>
