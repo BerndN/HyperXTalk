@@ -1845,6 +1845,7 @@ bool MCImage::setcompressedbitmap(MCImageCompressedBitmap *p_compressed)
 	case F_GIF:
 	case F_PNG:
 	case F_JPEG:
+	case F_WEBP:
 		t_success = MCImageRepGetResident(p_compressed->data, p_compressed->size, t_rep);
 		break;
 	case F_PICT:
