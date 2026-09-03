@@ -740,7 +740,6 @@ command scriptCompile pObject
       put "applied" into tState
    end if
    
-   
    send "clearErrors" to group "Errors" of the owner of me
    if tResult is empty then
       setCompilationErrors empty, pObject
@@ -749,7 +748,6 @@ command scriptCompile pObject
       setCompilationErrors line 1 of tResult, pObject
       put "error" into tState
    end if
-   
    
    seSetObjectState pObject, tState
    
