@@ -54,11 +54,18 @@ along with LiveCode.  If not see <http://www.gnu.org/licenses/>.  */
 // rebuild of all TUs that include lnxdc.h).
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 
 static std::vector<GdkWindow*> s_extra_backdrops;
 // Mirror of MCScreenDC::backdrop kept in sync so hxt_is_backdrop_window can
 // check it without needing a full MCScreenDC* cast.
 static GdkWindow *s_primary_backdrop = nullptr;
+// Mirror of MCScreenDC::m_backdrop_pixmap.  The deferred repaint timers at the
+// end of enablebackdrop() are captureless lambdas and cannot reach the private
+// member, but they MUST know whether a pattern is active: their flat fill uses
+// backdropcolor, which configurebackdrop() forces to black while a pattern is
+// in use.  Updated wherever m_backdrop_pixmap changes.
+static Pixmap s_backdrop_pixmap = DNULL;
 
 // XDG_CURRENT_DESKTOP never changes at runtime — cache the XFCE check once.
 static const bool s_is_xfce = []() {
@@ -1454,11 +1461,71 @@ void MCScreenDC::setinputfocus(Window window)
 	gdk_window_focus(window, MCeventtime);
 }
 
+// -- GTK3: `Window` is a GdkWindow*, but `Pixmap`/`Drawable` are integer
+// XID-shaped typedefs that createpixmap() actually stuffs a cairo_surface_t*
+// into.  Nothing in the type system distinguishes the two, so entry points
+// taking a Drawable cannot blindly cast to GdkWindow*: gdk_cairo_create()
+// g_return_val_if_fail()s to NULL for a non-window, and the next cairo_* call
+// then segfaults (e.g. cairo_set_operator).  Keep a registry of the surfaces we
+// hand out as Pixmaps so those entry points can tell which kind they were given.
+static std::unordered_set<uintptr_t> s_pixmap_surfaces;
+
+static bool hxt_drawable_is_pixmap(Drawable d)
+{
+	return d != DNULL &&
+	       s_pixmap_surfaces.find((uintptr_t)d) != s_pixmap_surfaces.end();
+}
+
+// Create a cairo context for either a GdkWindow or a pixmap surface.
+// Returns nullptr instead of crashing when handed something unusable.
+static cairo_t *hxt_cairo_create_for_drawable(Drawable d)
+{
+	if (d == DNULL)
+		return nullptr;
+
+	if (hxt_drawable_is_pixmap(d))
+		return cairo_create((cairo_surface_t*)d);
+
+	if (!GDK_IS_WINDOW((gpointer)d))
+		return nullptr;
+
+	return gdk_cairo_create((GdkWindow*)d);
+}
+
+// Set the source of p_cr from either a GdkWindow or a pixmap surface.
+static bool hxt_cairo_set_source_drawable(cairo_t *p_cr, Drawable s,
+                                         double p_x, double p_y)
+{
+	if (p_cr == nullptr || s == DNULL)
+		return false;
+
+	if (hxt_drawable_is_pixmap(s))
+	{
+		cairo_set_source_surface(p_cr, (cairo_surface_t*)s, p_x, p_y);
+		return true;
+	}
+
+	if (!GDK_IS_WINDOW((gpointer)s))
+		return false;
+
+	gdk_cairo_set_source_window(p_cr, (GdkWindow*)s, p_x, p_y);
+	return true;
+}
+
+// Flush pending cairo drawing when the destination was an image surface, so
+// later direct pixel access (cairo_image_surface_get_data) sees it.
+static void hxt_drawable_flush(Drawable d)
+{
+	if (hxt_drawable_is_pixmap(d))
+		cairo_surface_flush((cairo_surface_t*)d);
+}
+
 // -- tperry 15-11-2025: GTK3 - pixmaps are now cairo surfaces
 void MCScreenDC::freepixmap(Pixmap &pixmap)
 {
 	if (pixmap != DNULL)
 	{
+		s_pixmap_surfaces.erase((uintptr_t)pixmap);
 		cairo_surface_destroy((cairo_surface_t*)pixmap);
 		pixmap = DNULL;
 	}
@@ -1489,6 +1556,9 @@ Pixmap MCScreenDC::createpixmap(uint2 width, uint2 height,
 
 	cairo_surface_t *pm = cairo_image_surface_create(format, width, height);
 	assert(pm != DNULL);
+
+	// Register so hxt_drawable_is_pixmap() can recognise it later.
+	s_pixmap_surfaces.insert((uintptr_t)pm);
 
 	return (Pixmap)pm;
 }
@@ -1605,8 +1675,10 @@ void MCScreenDC::copyarea(Drawable s, Drawable d, int2 depth,
 
     assert(rop <= GXset);
 
-    // Create Cairo context for destination
-    cairo_t *cr = gdk_cairo_create((GdkWindow*)d);
+    // Create Cairo context for destination (window OR pixmap surface)
+    cairo_t *cr = hxt_cairo_create_for_drawable(d);
+    if (cr == nullptr)
+        return;
 
     // Set the operator based on rop
     if (rop != GXcopy)
@@ -1614,14 +1686,16 @@ void MCScreenDC::copyarea(Drawable s, Drawable d, int2 depth,
     else
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
 
-    // Set source from the source drawable
-    gdk_cairo_set_source_window(cr, (GdkWindow*)s, dx - sx, dy - sy);
-
-    // Paint the rectangle
-    cairo_rectangle(cr, dx, dy, sw, sh);
-    cairo_fill(cr);
+    // Set source from the source drawable (window OR pixmap surface)
+    if (hxt_cairo_set_source_drawable(cr, s, dx - sx, dy - sy))
+    {
+        // Paint the rectangle
+        cairo_rectangle(cr, dx, dy, sw, sh);
+        cairo_fill(cr);
+    }
 
     cairo_destroy(cr);
+    hxt_drawable_flush(d);
 }
 
 MCBitmap *MCScreenDC::createimage(uint16_t depth, uint16_t width, uint16_t height, bool set, uint8_t value)
@@ -1655,19 +1729,34 @@ void MCScreenDC::putimage(Drawable d, MCBitmap *source, int2 sx, int2 sy,
     // If we use gdk_draw_pixbuf, the pixbuf gets blended with the existing
     // contents of the window - something that we definitely do not want. We
     // need to use Cairo directly to do the drawing to the window surface.
-    cairo_t *t_cr = gdk_cairo_create((GdkWindow*)d);
+    // The destination may be a pixmap (cairo_surface_t) rather than a window --
+    // MCX11BitmapToX11Pixmap() calls us with a freshly created pixmap.
+    cairo_t *t_cr = hxt_cairo_create_for_drawable(d);
+    if (t_cr == nullptr)
+        return;
     cairo_set_operator(t_cr, CAIRO_OPERATOR_SOURCE);
     cairo_rectangle(t_cr, dx, dy, w, h);
     cairo_clip(t_cr);
     gdk_cairo_set_source_pixbuf(t_cr, source, dx-sx, dy-sy);
     cairo_paint(t_cr);
     cairo_destroy(t_cr);
+    hxt_drawable_flush(d);
 }
 
 // -- tperry 15-11-2025: GTK3 - gdk_pixbuf_get_from_drawable replaced with gdk_pixbuf_get_from_window
 MCBitmap *MCScreenDC::getimage(Drawable d, int2 x, int2 y, uint2 w, uint2 h)
 {
 	GdkPixbuf *t_image;
+    if (d == DNULL)
+        return nil;
+    if (hxt_drawable_is_pixmap(d))
+    {
+        cairo_surface_flush((cairo_surface_t*)d);
+        t_image = gdk_pixbuf_get_from_surface((cairo_surface_t*)d, x, y, w, h);
+        return (MCBitmap*)t_image;
+    }
+    if (!GDK_IS_WINDOW((gpointer)d))
+        return nil;
     t_image = gdk_pixbuf_get_from_window((GdkWindow*)d, x, y, w, h);
     return (MCBitmap*)t_image;
 }
@@ -2096,6 +2185,60 @@ void MCScreenDC::hidebackdrop(bool p_hide)
 }
 
 
+// Give the backdrop window a background that survives being mapped and
+// exposed.  GTK2 got this from gdk_window_set_back_pixmap(); in GTK3 a pattern
+// with CAIRO_EXTEND_REPEAT is the equivalent.  Without it, the direct paint
+// below is discarded when the window has just been created (GDK's visible
+// region is still empty and the expose that follows the map clears the window
+// to its flat background), which is why the first `set the backdrop to <id>`
+// after `none` came up solid black: configurebackdrop() sets backdropcolor to
+// black via MCColorSetPixel(backdropcolor, 0) whenever a pattern is in use.
+static void set_backdrop_background(GdkWindow *p_win,
+                                    const MCColor &p_color,
+                                    Pixmap p_pixmap)
+{
+    if (!p_win)
+        return;
+
+    if (p_pixmap != DNULL)
+    {
+        cairo_pattern_t *t_pattern =
+            cairo_pattern_create_for_surface((cairo_surface_t *)p_pixmap);
+        cairo_pattern_set_extend(t_pattern, CAIRO_EXTEND_REPEAT);
+        gdk_window_set_background_pattern(p_win, t_pattern);
+        cairo_pattern_destroy(t_pattern);
+        return;
+    }
+
+    GdkRGBA t_rgba;
+    t_rgba.red   = p_color.red   / 65535.0;
+    t_rgba.green = p_color.green / 65535.0;
+    t_rgba.blue  = p_color.blue  / 65535.0;
+    t_rgba.alpha = 1.0;
+    gdk_window_set_background_rgba(p_win, &t_rgba);
+}
+
+// Tile p_pixmap across p_win.  p_w / p_h are GDK logical pixels.
+static void paint_backdrop_pattern(GdkWindow *p_win, gint p_w, gint p_h,
+                                   Pixmap p_pixmap)
+{
+    cairo_t *cr = gdk_cairo_create(p_win);
+    cairo_reset_clip(cr);
+    cairo_rectangle(cr, 0, 0, (double)p_w, (double)p_h);
+    cairo_clip(cr);
+    cairo_set_source_surface(cr, (cairo_surface_t *)p_pixmap, 0, 0);
+    // Backdrop patterns tile across the whole window (GTK2 got this from
+    // gdk_window_set_back_pixmap); cairo's default EXTEND_NONE would paint a
+    // single tile in the top-left corner and leave the rest unpainted.
+    cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_REPEAT);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+
+    // If the direct paint above was clipped away (window just mapped), the
+    // invalidate makes GDK repaint from the background pattern.
+    gdk_window_invalidate_rect(p_win, NULL, TRUE);
+}
+
 // Paint the current backdrop color/pattern onto a GdkWindow.
 // p_w / p_h are the ACTUAL X11 window dimensions (not GDK's stale cache).
 //
@@ -2114,6 +2257,10 @@ static void paint_backdrop_gdk_window(GdkWindow *p_win,
 {
     if (!p_win)
         return;
+
+    // Keep the window background in step with what we are about to paint, so a
+    // later expose repaints the same thing instead of a flat colour.
+    set_backdrop_background(p_win, p_color, p_pixmap);
 
     GdkDisplay   *t_gdkdpy = gdk_window_get_display(p_win);
     x11::Display *t_xdpy   = x11::gdk_x11_display_get_xdisplay(t_gdkdpy);
@@ -2146,13 +2293,40 @@ static void paint_backdrop_gdk_window(GdkWindow *p_win,
 
     // Pixmap path: use Cairo (pixmaps are already in X11 device space so
     // the visible-region clip issue does not affect correctness here).
-    cairo_t *cr = gdk_cairo_create(p_win);
-    cairo_reset_clip(cr);
-    cairo_rectangle(cr, 0, 0, (double)p_w, (double)p_h);
-    cairo_clip(cr);
-    cairo_set_source_surface(cr, (cairo_surface_t *)p_pixmap, 0, 0);
-    cairo_paint(cr);
-    cairo_destroy(cr);
+    paint_backdrop_pattern(p_win, p_w, p_h, p_pixmap);
+}
+
+// Repaint one backdrop window from the deferred timers below.  p_w / p_h are
+// PHYSICAL pixels, as the timers track geometry in X11 coordinates.
+static void hxt_deferred_repaint_one(x11::Display *p_xdpy, x11::Window p_xwin,
+                                     GdkWindow *p_gdkwin,
+                                     int p_w, int p_h, unsigned long p_pixel)
+{
+    // A pattern backdrop must be tiled through Cairo.  The flat fill below
+    // paints backdropcolor, which is black whenever a pattern is active, so
+    // using it here repainted the backdrop solid black ~200ms and ~500ms after
+    // enablebackdrop() -- the first `set the backdrop to <id>` after `none`.
+    // hxt_is_backdrop_window() guards against the window having been destroyed
+    // and replaced between scheduling and firing.
+    if (s_backdrop_pixmap != DNULL && p_gdkwin != nullptr &&
+        hxt_is_backdrop_window(p_gdkwin))
+    {
+        int t_scale = gdk_window_get_scale_factor(p_gdkwin);
+        if (t_scale < 1)
+            t_scale = 1;
+        paint_backdrop_pattern(p_gdkwin, p_w / t_scale, p_h / t_scale,
+                               s_backdrop_pixmap);
+        return;
+    }
+
+    x11::XGCValues t_gcv = {};
+    t_gcv.foreground = p_pixel;
+    t_gcv.clip_mask  = None;
+    x11::GC t_gc = x11::XCreateGC(p_xdpy, (x11::Drawable)p_xwin,
+                                    GCForeground | GCClipMask, &t_gcv);
+    x11::XFillRectangle(p_xdpy, (x11::Drawable)p_xwin, t_gc,
+                        0, 0, (unsigned)p_w, (unsigned)p_h);
+    x11::XFreeGC(p_xdpy, t_gc);
 }
 
 void MCScreenDC::createbackdrop_window(void)
@@ -2353,12 +2527,10 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                 x11::XFlush(t_xdpy);
             }
 
-            GdkRGBA t_rgba;
-            t_rgba.red   = backdropcolor.red   / 65535.0;
-            t_rgba.green = backdropcolor.green / 65535.0;
-            t_rgba.blue  = backdropcolor.blue  / 65535.0;
-            t_rgba.alpha = 1.0;
-            gdk_window_set_background_rgba(p_win, &t_rgba);
+            // Pattern backdrops need a repeating surface pattern here, not a
+            // flat colour: backdropcolor is forced to black while a pattern is
+            // active, so a flat background would show through as solid black.
+            set_backdrop_background(p_win, backdropcolor, m_backdrop_pixmap);
 
             // Map and immediately raise to cover other windows.
             // No keep_above — we stay in the NORMAL layer so ALT+TAB works.
@@ -2454,6 +2626,7 @@ void MCScreenDC::enablebackdrop(bool p_hard)
         struct BackdropDiag {
             x11::Display *xdpy;
             x11::Window   xwin[4];
+            GdkWindow    *gwin[4];                    // for the pattern repaint path
             int           tx[4], ty[4], tw[4], th[4]; // target geometry (physical px)
             int           count;
             unsigned long pixel;
@@ -2473,6 +2646,7 @@ void MCScreenDC::enablebackdrop(bool p_hard)
             if (t_nmon_bd < 1) t_nmon_bd = 1;
             int t_s0 = gdk_window_get_scale_factor(s_primary_backdrop);
             bd->xwin[0] = x11::gdk_x11_window_get_xid(s_primary_backdrop);
+            bd->gwin[0] = s_primary_backdrop;
             bd->count   = 1;
 
             if (s_wm_is_marco && s_extra_backdrops.empty() && t_nmon_bd > 1)
@@ -2513,6 +2687,7 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                         int t_si = gdk_window_get_scale_factor(s_extra_backdrops[i]);
                         int k = bd->count;
                         bd->xwin[k] = x11::gdk_x11_window_get_xid(s_extra_backdrops[i]);
+                        bd->gwin[k] = s_extra_backdrops[i];
                         bd->tx[k]   = t_gi.x * t_si; bd->ty[k] = t_gi.y * t_si;
                         bd->tw[k]   = t_gi.width * t_si; bd->th[k] = t_gi.height * t_si;
                         bd->count++;
@@ -2555,15 +2730,9 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                                         &t_ev);
                     }
 
-                    // Repaint this backdrop.
-                    x11::XGCValues t_gcv = {};
-                    t_gcv.foreground = d->pixel;
-                    t_gcv.clip_mask  = None;
-                    x11::GC t_gc = x11::XCreateGC(d->xdpy, (x11::Drawable)d->xwin[i],
-                                                   GCForeground | GCClipMask, &t_gcv);
-                    x11::XFillRectangle(d->xdpy, (x11::Drawable)d->xwin[i], t_gc,
-                                        0, 0, (unsigned)d->tw[i], (unsigned)d->th[i]);
-                    x11::XFreeGC(d->xdpy, t_gc);
+                    // Repaint this backdrop (colour fill, or pattern tile).
+                    hxt_deferred_repaint_one(d->xdpy, d->xwin[i], d->gwin[i],
+                                             d->tw[i], d->th[i], d->pixel);
                 }
                 x11::XFlush(d->xdpy);
 
@@ -2572,6 +2741,7 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                 struct RepaintData {
                     x11::Display *xdpy;
                     x11::Window   xwin[4];
+                    GdkWindow    *gwin[4];
                     int           tw[4], th[4];
                     int           count;
                     unsigned long pixel;
@@ -2582,6 +2752,7 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                 rd->pixel = d->pixel;
                 for (int i = 0; i < d->count; i++) {
                     rd->xwin[i] = d->xwin[i];
+                    rd->gwin[i] = d->gwin[i];
                     rd->tw[i]   = d->tw[i];
                     rd->th[i]   = d->th[i];
                 }
@@ -2589,16 +2760,9 @@ void MCScreenDC::enablebackdrop(bool p_hard)
                     +[](gpointer p2) -> gboolean {
                         auto *rd2 = static_cast<RepaintData*>(p2);
                         for (int i = 0; i < rd2->count; i++) {
-                            x11::XGCValues t_gcv2 = {};
-                            t_gcv2.foreground = rd2->pixel;
-                            t_gcv2.clip_mask  = None;
-                            x11::GC t_gc2 = x11::XCreateGC(
-                                rd2->xdpy, (x11::Drawable)rd2->xwin[i],
-                                GCForeground | GCClipMask, &t_gcv2);
-                            x11::XFillRectangle(rd2->xdpy, (x11::Drawable)rd2->xwin[i],
-                                                t_gc2, 0, 0,
-                                                (unsigned)rd2->tw[i], (unsigned)rd2->th[i]);
-                            x11::XFreeGC(rd2->xdpy, t_gc2);
+                            hxt_deferred_repaint_one(rd2->xdpy, rd2->xwin[i],
+                                                     rd2->gwin[i], rd2->tw[i],
+                                                     rd2->th[i], rd2->pixel);
                         }
                         x11::XFlush(rd2->xdpy);
                         return G_SOURCE_REMOVE;
@@ -2654,6 +2818,8 @@ void MCScreenDC::configurebackdrop(const MCColor& p_colour, MCPatternRef p_patte
 
 	if (p_pattern != nil)
 		/* UNCHECKED */ MCPatternToX11Pixmap(p_pattern, m_backdrop_pixmap);
+
+	s_backdrop_pixmap = m_backdrop_pixmap;
 
 	if ( backdrop == DNULL )
 		createbackdrop_window();
@@ -2796,6 +2962,7 @@ void MCScreenDC::destroybackdrop()
     s_extra_backdrops.clear();
 
 	freepixmap(m_backdrop_pixmap);
+	s_backdrop_pixmap = DNULL;
 }
 
 
