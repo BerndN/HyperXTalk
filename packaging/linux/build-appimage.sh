@@ -46,7 +46,7 @@ cp "$OUT_DIR/HyperXTalk" "$APPBIN/"
 strip --strip-debug "$APPBIN/HyperXTalk" 2>/dev/null || true
 
 # --- IDE content (Toolset, Resources, Documentation, Plugins, etc.) ---
-for subdir in Toolset Resources Documentation Plugins Externals; do
+for subdir in Toolset Resources Documentation Plugins Externals Ext; do
     if [ -d "$IDE_DIR/$subdir" ]; then
         cp -a "$IDE_DIR/$subdir" "$APPBIN/"
     fi
